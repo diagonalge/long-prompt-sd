@@ -1,224 +1,321 @@
-import time
+from hashlib import sha512
 import os
 from typing import List
-import json
+import time
+import requests
 
-from tqdm.auto import tqdm
 import torch
 from cog import BasePredictor, Input, Path
 from diffusers import (
     DiffusionPipeline,
-    StableDiffusionImg2ImgPipeline,
-    DDIMScheduler,
-    DPMSolverMultistepScheduler,
-    EulerAncestralDiscreteScheduler,
-    EulerDiscreteScheduler,
-    HeunDiscreteScheduler,
-    LMSDiscreteScheduler,
     PNDMScheduler,
-    UniPCMultistepScheduler,
+    LMSDiscreteScheduler,
+    DDIMScheduler,
+    EulerDiscreteScheduler,
+    EulerAncestralDiscreteScheduler,
+    DPMSolverMultistepScheduler,
 )
-from diffusers.pipelines.stable_diffusion.safety_checker import (
-    StableDiffusionSafetyChecker,
-)
+import numpy as np
+
+from lora_diffusion import LoRAManager, monkeypatch_remove_lora
+from t2i_adapters import Adapter
+from t2i_adapters import patch_pipe as patch_pipe_t2i_adapter
 from PIL import Image
-from transformers import CLIPFeatureExtractor
-import shutil
-import subprocess
-from diffusers.utils import load_image
 
-SAFETY_MODEL_CACHE = "diffusers-cache"
-SAFETY_MODEL_ID = "CompVis/stable-diffusion-safety-checker"
+import dotenv
+import os
 
-DEFAULT_HEIGHT = 512
-DEFAULT_WIDTH = 512
-DEFAULT_SCHEDULER = "DDIM"
-DEFAULT_GUIDANCE_SCALE = 7.5
-DEFAULT_NUM_INFERENCE_STEPS = 50
-DEFAULT_STRENGTH = 0.8
+dotenv.load_dotenv()
 
-# grab instance_prompt from weights,
-# unless empty string or not existent
-
-DEFAULT_PROMPT = "a photo of an astronaut riding a horse on mars"
+MODEL_ID = os.environ.get("MODEL_ID", None)
+MODEL_CACHE = "diffusers-cache"
+SAFETY_MODEL_ID = os.environ.get("SAFETY_MODEL_ID", None)
+IS_FP16 = os.environ.get("IS_FP16", "0") == "1"
 
 
-class KerrasDPM:
-    def from_config(config):
-        return DPMSolverMultistepScheduler.from_config(config, use_karras_sigmas=True)
+def url_local_fn(url):
+    return sha512(url.encode()).hexdigest() + ".safetensors"
 
 
-SCHEDULERS = {
-    "DDIM": DDIMScheduler,
-    "DPMSolverMultistep": DPMSolverMultistepScheduler,
-    "HeunDiscrete": HeunDiscreteScheduler,
-    "KerrasDPM": KerrasDPM,
-    "K_EULER_ANCESTRAL": EulerAncestralDiscreteScheduler,
-    "K_EULER": EulerDiscreteScheduler,
-    "KLMS": LMSDiscreteScheduler,
-    "PNDM": PNDMScheduler,
-    "UniPCMultistep": UniPCMultistepScheduler,
-}
+def download_lora(url):
+    # TODO: allow-list of domains
+
+    fn = url_local_fn(url)
+
+    if not os.path.exists(fn):
+        print("Downloading LoRA model... from", url)
+        # stream chunks of the file to disk
+        with requests.get(url, stream=True) as r:
+            r.raise_for_status()
+            with open(fn, "wb") as f:
+                for chunk in r.iter_content(chunk_size=8192):
+                    f.write(chunk)
+
+    else:
+        print("Using disk cache...")
+
+    return fn
 
 
 class Predictor(BasePredictor):
     def setup(self):
-        self.safety_checker = StableDiffusionSafetyChecker.from_pretrained(
-            SAFETY_MODEL_ID,
-            cache_dir=SAFETY_MODEL_CACHE,
-            torch_dtype=torch.float16,
-            local_files_only=True,
-        ).to("cuda")
-        self.feature_extractor = CLIPFeatureExtractor.from_pretrained(
-            "openai/clip-vit-base-patch32", cache_dir=SAFETY_MODEL_CACHE
-        )
-        self.url = None
-
-
-    def download_tar_weights(self, url):
-        """Download the model weights from the given URL"""
-        print("Downloading weights...")
-
-        if os.path.exists("weights"):
-            shutil.rmtree("weights")
-        os.makedirs("weights")
-        subprocess.check_output(["script/get_weights.sh", url], stderr=subprocess.STDOUT)
-
-    def download_zip_weights_python(self, url):
-        """Download the model weights from the given URL"""
-        print("Downloading weights...")
-   
-        if os.path.exists("weights"):
-            shutil.rmtree("weights")
-        os.makedirs("weights")
-
-        import zipfile
-        from io import BytesIO
-        import urllib.request
-
-        url = urllib.request.urlopen(url)
-        with zipfile.ZipFile(BytesIO(url.read())) as zf:
-            zf.extractall("weights")
-
-    def load_weights(self, url):
         """Load the model into memory to make running multiple predictions efficient"""
-        print("Loading Safety pipeline...")
+        print("Loading pipeline...")
 
-        if url == self.url:
-            return
+        self.pipe = DiffusionPipeline.from_pretrained(
+            MODEL_CACHE,
+            custom_pipeline="lpw_stable_diffusion",
+            torch_dtype=torch.float16 if IS_FP16 else torch.float32,
+        ).to("cuda")
 
-        start_time = time.time()
-        self.download_zip_weights_python(url)
-        print("Downloaded weights in {:.2f} seconds".format(time.time() - start_time))
+        patch_pipe_t2i_adapter(self.pipe)
 
-        start_time = time.time()
-        print("Loading SD pipeline...")
-        self.txt2img_pipe = DiffusionPipeline.from_pretrained(
-            "weights",
-            safety_checker=self.safety_checker,
-            feature_extractor=self.feature_extractor,
-            torch_dtype=torch.float16,
+        self.adapters = {
+            ext_type: Adapter.from_pretrained(ext_type).to("cuda")
+            for ext_type, _ in [
+                ("depth", "antique house"),
+                ("seg", "motorcycle"),
+                ("keypose", "elon musk"),
+                ("sketch", "robot owl"),
+            ]
+        }
+
+        self.img2img_pipe = DiffusionPipeline(
+            vae=self.pipe.vae,
+            text_encoder=self.pipe.text_encoder,
+            tokenizer=self.pipe.tokenizer,
+            unet=self.pipe.unet,
+            scheduler=self.pipe.scheduler,
+            safety_checker=self.pipe.safety_checker,
+            feature_extractor=self.pipe.feature_extractor,
             custom_pipeline="lpw_stable_diffusion"
         ).to("cuda")
 
-        self.img2img_pipe = StableDiffusionImg2ImgPipeline(
-            vae=self.txt2img_pipe.vae,
-            text_encoder=self.txt2img_pipe.text_encoder,
-            tokenizer=self.txt2img_pipe.tokenizer,
-            unet=self.txt2img_pipe.unet,
-            scheduler=self.txt2img_pipe.scheduler,
-            safety_checker=self.txt2img_pipe.safety_checker,
-            feature_extractor=self.txt2img_pipe.feature_extractor,
-        ).to("cuda")
-        print("Loaded pipelines in {:.2f} seconds".format(time.time() - start_time))
+        self.token_size_list: list = []
+        self.ranklist: list = []
+        self.loaded = None
+        self.lora_manager = None
 
-        self.txt2img_pipe.set_progress_bar_config(disable=True)
-        self.img2img_pipe.set_progress_bar_config(disable=True)
-        self.url = url
+    def set_lora(self, urllists: List[str], scales: List[float]):
+        assert len(urllists) == len(scales), "Number of LoRAs and scales must match."
 
-    def generate_images(self, images, output_dir):
-        with torch.autocast("cuda"), torch.inference_mode():
-            for info in tqdm(images, desc="Generating samples"):
-                inputs = info.get("input") or info.get("inputs")
-                name = info["name"]
-                print(name)
+        merged_fn = url_local_fn(f"{'-'.join(urllists)}")
 
-                num_outputs = int(inputs.get("num_outputs", 1))
+        if self.loaded == merged_fn:
+            print("The requested LoRAs are loaded.")
+            assert self.lora_manager is not None
+        else:
 
-                kwargs = {
-                    "prompt": [inputs["prompt"]] * num_outputs,
-                    "num_inference_steps": int(inputs.get("num_inference_steps", DEFAULT_NUM_INFERENCE_STEPS)),
-                    "guidance_scale": float(inputs.get("guidance_scale", DEFAULT_GUIDANCE_SCALE)),
-                }
+            st = time.time()
+            self.lora_manager = LoRAManager(
+                [download_lora(url) for url in urllists], self.pipe
+            )
+            self.loaded = merged_fn
+            print(f"merging time: {time.time() - st}")
 
-                image = inputs.get("image")
-                if image is not None:
-                    kwargs['image'] = load_image(image)
-                    kwargs['strength'] = float(inputs.get('strength', DEFAULT_STRENGTH))
-                    pipeline = self.img2img_pipe
-                else:
-                    pipeline = self.txt2img_pipe
-                    kwargs["width"] = int(inputs.get("width", DEFAULT_WIDTH))
-                    kwargs["height"] = int(inputs.get("height", DEFAULT_HEIGHT))
-
-                negative_prompt = inputs.get("negative_prompt")
-                if negative_prompt is not None:
-                    kwargs["negative_prompt"] = [negative_prompt] * num_outputs
-
-                scheduler = inputs.get("scheduler", DEFAULT_SCHEDULER)
-                pipeline.scheduler = SCHEDULERS[scheduler].from_config(pipeline.scheduler.config)
-
-                if bool(inputs.get("disable_safety_check", False)):
-                    pipeline.safety_checker = None
-                else:
-                    pipeline.safety_checker = self.safety_checker
-
-                seed = int(inputs.get("seed", int.from_bytes(os.urandom(2), "big")))
-                generator = torch.Generator("cuda").manual_seed(seed)
-                output = pipeline.text2img(
-                    generator=generator,
-                    max_embeddings_multiples=3,
-                    **kwargs,
-                )
-
-                for i, image in enumerate(output.images):
-                    if output.nsfw_content_detected and output.nsfw_content_detected[i]:
-                        print("skipping nsfw detected for", inputs)
-                        continue
-                    image.save(os.path.join(output_dir, f"{name}-{i}.png"))
-
+        self.lora_manager.tune(scales)
 
     @torch.inference_mode()
     def predict(
         self,
-        images: str = Input(
-            description="JSON input",
+        prompt: str = Input(
+            description="Input prompt. Use <1>, <2>, <3>, etc., to specify LoRA concepts",
+            default="a photo of <1> riding a horse on mars",
         ),
-        weights: str = Input(
-            description="URL to weights",
+        negative_prompt: str = Input(
+            description="Specify things to not see in the output",
+            default="",
+        ),
+        width: int = Input(
+            description="Width of output image. Maximum size is 1024x768 or 768x1024 because of memory limits",
+            choices=[128, 256, 384, 448, 512, 576, 640, 704, 768, 832, 896, 960, 1024],
+            default=512,
+        ),
+        height: int = Input(
+            description="Height of output image. Maximum size is 1024x768 or 768x1024 because of memory limits",
+            choices=[128, 256, 384, 448, 512, 576, 640, 704, 768, 832, 896, 960, 1024],
+            default=512,
+        ),
+        num_outputs: int = Input(
+            description="Number of images to output.",
+            ge=1,
+            le=4,
+            default=1,
+        ),
+        num_inference_steps: int = Input(
+            description="Number of denoising steps", ge=1, le=500, default=50
+        ),
+        guidance_scale: float = Input(
+            description="Scale for classifier-free guidance", ge=1, le=20, default=7.5
+        ),
+        image: Path = Input(
+            description="(Img2Img) Inital image to generate variations of. If this is not none, Img2Img will be invoked.",
+            default=None,
+        ),
+        prompt_strength: float = Input(
+            description="(Img2Img) Prompt strength when providing the image. 1.0 corresponds to full destruction of information in init image",
+            default=0.8,
+        ),
+        scheduler: str = Input(
+            default="DPMSolverMultistep",
+            choices=[
+                "DDIM",
+                "K_EULER",
+                "DPMSolverMultistep",
+                "K_EULER_ANCESTRAL",
+                "PNDM",
+                "KLMS",
+            ],
+            description="Choose a scheduler.",
+        ),
+        lora_urls: str = Input(
+            description="List of urls for safetensors of lora models, seperated with | .",
+            default="",
+        ),
+        lora_scales: str = Input(
+            description="List of scales for safetensors of lora models, seperated with | ",
+            default="0.5",
+        ),
+        seed: int = Input(
+            description="Random seed. Leave blank to randomize the seed", default=None
+        ),
+        adapter_condition_image: Path = Input(
+            description="(T2I-adapter) Adapter Condition Image to gain extra control over generation. If this is not none, T2I adapter will be invoked. Width, Height of this image must match the above parameter, or dimension of the Img2Img image.",
+            default=None,
+        ),
+        adapter_type: str = Input(
+            description="(T2I-adapter) Choose an adapter type for the additional condition.",
+            choices=["sketch", "seg", "keypose", "depth"],
+            default="sketch",
         ),
     ) -> List[Path]:
         """Run a single prediction on the model"""
+        if seed is None:
+            seed = int.from_bytes(os.urandom(2), "big")
+        print(f"Using seed: {seed}")
 
-        weights = weights.replace("https://replicate.delivery/pbxt/", "https://storage.googleapis.com/replicate-files/")
+        if image is not None:
+            pil_image = Image.open(image).convert("RGB")
+            width, height = pil_image.size
 
-        images_json = json.loads(images)
-    
-        if weights is None:
-            raise ValueError("No weights provided")
-        self.load_weights(weights)
+        print(f"Generating image of {width} x {height} with prompt: {prompt}")
 
-        cog_generated_images = "cog_generated_images"
-        if os.path.exists(cog_generated_images):
-            shutil.rmtree(cog_generated_images)
-        os.makedirs(cog_generated_images)
+        if width * height > 786432:
+            raise ValueError(
+                "Maximum size is 1024x768 or 768x1024 pixels, because of memory limits. Please select a lower width or height."
+            )
 
-        self.generate_images(images_json, cog_generated_images)
+        generator = torch.Generator("cuda").manual_seed(seed)
 
-        directory = Path(cog_generated_images)
+        if len(lora_urls) > 0:
+            lora_urls = [u.strip() for u in lora_urls.split("|")]
+            lora_scales = [float(s.strip()) for s in lora_scales.split("|")]
+            self.set_lora(lora_urls, lora_scales)
+            prompt = self.lora_manager.prompt(prompt)
+        else:
+            print("No LoRA models provided, using default model...")
+            monkeypatch_remove_lora(self.pipe.unet)
+            monkeypatch_remove_lora(self.pipe.text_encoder)
 
-        results = []
-        for file_path in directory.rglob("*"):
-            print(file_path)
-            results.append(file_path)
-        return results
+        # handle t2i adapter
+        w_c, h_c = None, None
+
+        if adapter_condition_image is not None:
+
+            cond_img = Image.open(adapter_condition_image)
+            w_c, h_c = cond_img.size
+
+            if w_c != width or h_c != height:
+                raise ValueError(
+                    "Width and height of the adapter condition image must match the width and height of the generated image."
+                )
+
+            if adapter_type == "sketch":
+                cond_img = cond_img.convert("L")
+                cond_img = np.array(cond_img) / 255.0
+                cond_img = (
+                    torch.from_numpy(cond_img).unsqueeze(0).unsqueeze(0).to("cuda")
+                )
+                cond_img = (cond_img > 0.5).float()
+
+            else:
+                cond_img = cond_img.convert("RGB")
+                cond_img = np.array(cond_img) / 255.0
+
+                cond_img = (
+                    torch.from_numpy(cond_img)
+                    .permute(2, 0, 1)
+                    .unsqueeze(0)
+                    .to("cuda")
+                    .float()
+                )
+
+            with torch.no_grad():
+                adapter_features = self.adapters[adapter_type](cond_img)
+
+            self.pipe.unet.set_adapter_features(adapter_features)
+        else:
+            self.pipe.unet.set_adapter_features(None)
+
+        # either text2img or img2img
+        if image is None:
+            self.pipe.scheduler = make_scheduler(scheduler, self.pipe.scheduler.config)
+
+            output = self.pipe.text2img(
+                prompt=[prompt] * num_outputs if prompt is not None else None,
+                negative_prompt=[negative_prompt] * num_outputs
+                if negative_prompt is not None
+                else None,
+                width=width,
+                height=height,
+                guidance_scale=guidance_scale,
+                generator=generator,
+                num_inference_steps=num_inference_steps,
+            )
+        else:
+            extra_kwargs = {
+                "image": pil_image,
+                "strength": prompt_strength,
+            }
+
+            self.img2img_pipe.scheduler = make_scheduler(
+                scheduler, self.pipe.scheduler.config
+            )
+
+            output = self.img2img_pipe.img2img(
+                prompt=[prompt] * num_outputs if prompt is not None else None,
+                negative_prompt=[negative_prompt] * num_outputs
+                if negative_prompt is not None
+                else None,
+                guidance_scale=guidance_scale,
+                generator=generator,
+                num_inference_steps=num_inference_steps,
+                **extra_kwargs,
+            )
+
+        output_paths = []
+        for i, sample in enumerate(output.images):
+            if output.nsfw_content_detected and output.nsfw_content_detected[i]:
+                continue
+
+            output_path = f"/tmp/out-{i}.png"
+            sample.save(output_path)
+            output_paths.append(Path(output_path))
+
+        if len(output_paths) == 0:
+            raise Exception(
+                "NSFW content detected. Try running it again, or try a different prompt."
+            )
+
+        return output_paths
+
+
+def make_scheduler(name, config):
+    return {
+        "PNDM": PNDMScheduler.from_config(config),
+        "KLMS": LMSDiscreteScheduler.from_config(config),
+        "DDIM": DDIMScheduler.from_config(config),
+        "K_EULER": EulerDiscreteScheduler.from_config(config),
+        "K_EULER_ANCESTRAL": EulerAncestralDiscreteScheduler.from_config(config),
+        "DPMSolverMultistep": DPMSolverMultistepScheduler.from_config(config),
+    }[name]
